@@ -56,30 +56,29 @@ struct Job {
 // backend
 class Backend {
 public:
-  virtual void generate(const std::string& prompt,
-                        int max_tokens,
-                        const std::function<void(const std::string&)>& on_token,
-                        const std::function<void(int /*tokens_out*/)> &on_done) = 0;
+  virtual void init(Job& job) = 0;
+  virtual bool step(Job& job, std::string& tok) = 0; // true = emitted a token
   virtual ~Backend() = default;
 };
 
 class MockBackend : public Backend {
 public:
-  void generate(const std::string& prompt,
-                int max_tokens,
-                const std::function<void(const std::string&)>& on_token,
-                const std::function<void(int)>& on_done) override {
-    auto toks = split_words(prompt);
-    int emitted = 0;
-    for (const auto& t : toks) {
-      if (emitted >= max_tokens) break;
-      on_token(t);
-      emitted++;
-      std::this_thread::sleep_for(std::chrono::milliseconds(40));
-    }
-    on_done(emitted);
+  void init(Job& job) override {
+    job.toks = split_words(job.prompt);
+    job.idx = 0;
+    job.tokens_out = 0;
+    job.initialized = true;
+  }
+
+  bool step(Job& job, std::string& tok) override {
+    if (job.tokens_out >= job.max_tokens) return false;
+    if (job.idx >= job.toks.size()) return false;
+    tok = job.toks[job.idx++];
+    job.tokens_out++;
+    return true;
   }
 };
+
 
 // global job_q
 static std::queue<std::shared_ptr<Job>> job_queue;
@@ -88,53 +87,69 @@ static std::condition_variable job_queue_cv;
 
 static std::atomic<bool> running{true};
 
-// --- worker thread: pop jobs, call backend, push SSE chunks into job->out ---
-static void worker_loop(Backend& backend) {
-  while (running.load()) {
-    std::shared_ptr<Job> job;
 
-    // wait for a job
+
+static constexpr int MAX_BATCH = 32;
+static constexpr int TICK_MS = 20;
+
+static void scheduler_loop(Backend& backend) {
+  std::vector<std::shared_ptr<Job>> active;
+  active.reserve(MAX_BATCH);
+
+  while (running.load()) {
+    // 1) pull jobs into active (up to MAX_BATCH)
     {
       std::unique_lock<std::mutex> lk(job_queue_m);
-      job_queue_cv.wait(lk, [] { return !job_queue.empty() || !running.load(); });
-      if (!running.load()) break;
-
-      job = job_queue.front();
-      job_queue.pop();
+      if (active.empty()) {
+        job_queue_cv.wait(lk, [] { return !job_queue.empty() || !running.load(); });
+        if (!running.load()) break;
+      }
+      while (!job_queue.empty() && (int)active.size() < MAX_BATCH) {
+        active.push_back(job_queue.front());
+        job_queue.pop();
+      }
     }
 
-    // generate tokens fake-asyncly
-    backend.generate(
-      job->prompt,
-      job->max_tokens,
+    // 2) A1, B1, C1... (one token per job, in order)
+    for (size_t i = 0; i < active.size(); ) {
+      auto job = active[i];
+      if (!job->initialized) backend.init(*job);
 
-      [job](const std::string& tok) {
+      std::string tok;
+      if (backend.step(*job, tok)) {
         std::string msg = sse(json({{"token", tok}}));
         {
           std::lock_guard<std::mutex> lk(job->m);
           job->out.push_back(std::move(msg));
         }
         job->cv.notify_one();
-      },
-
-      [job](int tokens_out) {
-        std::string done_msg = sse(json({{"done", true}, {"tokens_out", tokens_out}}));
+        ++i; // next job (this is the "round robin" step)
+      } else {
+        // finished this job
+        std::string done_msg = sse(json({{"done", true}, {"tokens_out", job->tokens_out}}));
         {
           std::lock_guard<std::mutex> lk(job->m);
           job->out.push_back(std::move(done_msg));
           job->done = true;
         }
         job->cv.notify_all();
+
+        // remove job from active (swap-erase)
+        active[i] = active.back();
+        active.pop_back();
       }
-    );
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(TICK_MS));
   }
 }
+
 
 int main() {
   httplib::Server svr;
 
   MockBackend backend;
-  std::thread worker([&] { worker_loop(backend); });
+  std::thread worker([&]{ scheduler_loop(backend); });
 
   svr.Post("/v1/generate", [](const httplib::Request& req, httplib::Response& res) {
     json body = json::parse(req.body, nullptr, false);
@@ -191,12 +206,12 @@ int main() {
             done = job->done;
           }
 
-          // send everything we grabbed
+          // send sream
           for (auto& msg : to_send) {
             sink.write(msg.data(), msg.size());
           }
 
-          // if done and nothing left to send, close stream
+          // if done finish
           if (done) {
             sink.done();
             return true;
@@ -219,7 +234,7 @@ int main() {
 
   svr.listen("0.0.0.0", 8080);
 
-  // shutdown (listen blocks; this is mainly for completeness)
+  // shutdown 
   running.store(false);
   job_queue_cv.notify_all();
   if (worker.joinable()) worker.join();
